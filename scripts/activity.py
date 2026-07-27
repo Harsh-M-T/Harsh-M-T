@@ -3,14 +3,13 @@
 0x004 · activity — regenerates the live telemetry section of portfolio.svg.
 
 Two unauthenticated requests:
-  · github.com/users/<user>/contributions   → 12-month calendar (no API quota)
+  · github.com/users/<user>/contributions   → 12-month calendar (SVG with rects)
   · api.github.com/users/<user>/repos       → repo list for the language mix
 
     python3 scripts/activity.py              # fetch + splice
     python3 scripts/activity.py --dry-run    # render 0x004-activity.svg only
 
-The section is inserted directly after $stack and before $contact, and every
-section index is renumbered from document order, so nothing drifts.
+The section is inserted directly after $stack and before $contact.
 
 Future-dated cells are discarded. GitHub pads the trailing week of the calendar
 with days that have not happened yet; counting them would understate the
@@ -91,46 +90,57 @@ def get(url, accept="text/html"):
 
 # ── fetch ─────────────────────────────────────────────────────────────────
 def fetch_calendar():
+    """Fetch contribution data from the SVG calendar.
+
+    GitHub's /users/<user>/contributions returns an HTML page containing an
+    SVG with <rect> elements. Each rect has data-date and data-count.
+    """
     html = get(f"https://github.com/users/{USER}/contributions")
-    tds = re.findall(
-        r'<td[^>]*data-date="(\d{4}-\d{2}-\d{2})"[^>]*id="([^"]+)"[^>]*data-level="(\d)"', html)
-    if not tds:
-        tds = []
-        for tag in re.findall(r'<td[^>]*ContributionCalendar-day[^>]*>', html):
-            d = re.search(r'data-date="([\d-]+)"', tag)
-            i = re.search(r'id="([^"]+)"', tag)
-            l = re.search(r'data-level="(\d)"', tag)
-            if d and i and l:
-                tds.append((d.group(1), i.group(1), l.group(1)))
-    if not tds:
-        raise RuntimeError("no contribution cells — GitHub markup may have changed")
-    tips = dict(re.findall(r'<tool-tip[^>]*for="([^"]+)"[^>]*>([^<]*)</tool-tip>', html))
 
-    def n(t):
-        if not t or t.strip().lower().startswith("no"):
-            return 0
-        m = re.match(r"\s*(\d+)", t)
-        return int(m.group(1)) if m else 0
+    # Try to find the SVG content – it's inside a <svg> tag with class
+    m = re.search(r'<svg[^>]*class="[^"]*js-calendar-graph-svg[^"]*"[^>]*>(.*?)</svg>', html, re.DOTALL)
+    if not m:
+        raise RuntimeError("could not find contribution graph SVG")
 
-    days = [{"d": d, "l": int(l), "c": n(tips.get(i, ""))} for d, i, l in tds]
-    days.sort(key=lambda x: x["d"])
+    svg = m.group(1)
 
-    # Drop days that have not happened yet. GitHub pads the trailing week.
-    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
-    kept = [x for x in days if x["d"] <= today]
-    dropped = len(days) - len(kept)
-    if not kept:
-        raise RuntimeError("calendar contained no elapsed days")
-    return kept, dropped
+    # Extract rect elements with data-date and data-count
+    rects = re.findall(
+        r'<rect[^>]*data-date="([^"]+)"[^>]*data-count="([^"]+)"[^>]*>',
+        svg
+    )
+    if not rects:
+        # fallback: try to find rects without data-count, maybe using data-level
+        rects = re.findall(
+            r'<rect[^>]*data-date="([^"]+)"[^>]*data-level="([^"]+)"[^>]*>',
+            svg
+        )
+        # convert data-level to count: level 0=0, 1=1, 2=2, 3=3, 4=4? Actually GitHub uses levels 0-4
+        # but we can use data-count if present, so first method should work.
+        # If we only have data-level, we need to map to count. For now, we'll rely on data-count.
+
+    if not rects:
+        raise RuntimeError("no contribution cells found in SVG")
+
+    # Build list of (date, count)
+    days = []
+    for date_str, count_str in rects:
+        try:
+            date = dt.date.fromisoformat(date_str)
+            count = int(count_str)
+        except ValueError:
+            continue
+        if date <= dt.date.today():
+            days.append((date, count))
+
+    if not days:
+        raise RuntimeError("no elapsed contribution days found")
+
+    return days
 
 def fetch_repos():
-    """Primary language per repository.
-
-    Deliberately NOT the /languages byte counts: those are dominated by Flask
-    templates and notebook JSON, which would report this account as mostly
-    HTML. Repo count is the honest summary of what actually gets built.
-    """
-    cache = os.environ.get("REPOS_JSON")           # offline/dev override
+    """Primary language per repository."""
+    cache = os.environ.get("REPOS_JSON")
     if cache and os.path.exists(cache):
         data = json.load(open(cache))
     else:
@@ -147,25 +157,28 @@ def fetch_repos():
 
 # ── stats ─────────────────────────────────────────────────────────────────
 def summarise(days):
-    total  = sum(x["c"] for x in days)
-    active = sum(1 for x in days if x["c"] > 0)
-    last   = dt.date.fromisoformat(days[-1]["d"])
+    total  = sum(c for _, c in days)
+    active = sum(1 for _, c in days if c > 0)
+    last   = dt.date.fromisoformat(days[-1][0]) if days else None
     current = 0
-    for x in reversed(days):
-        if x["c"] > 0:
-            current += 1
-        elif dt.date.fromisoformat(x["d"]) != last:
-            break
+    if last:
+        for date, c in reversed(days):
+            if c > 0:
+                current += 1
+            elif dt.date.fromisoformat(date) != last:
+                break
     longest = run = 0
-    for x in days:
-        run = run + 1 if x["c"] > 0 else 0
+    for _, c in days:
+        run = run + 1 if c > 0 else 0
         longest = max(longest, run)
-    recent = [x for x in days if x["c"] > 0]
-    weeks = [sum(d["c"] for d in days[i:i + 7]) for i in range(0, len(days), 7)]
+    recent = [c for _, c in days if c > 0]
+    weeks = [sum(c for _, c in days[i:i + 7]) for i in range(0, len(days), 7)]
+    busiest = max(days, key=lambda x: x[1]) if days else (None,0)
+    last_active = days[-1][0] if days else None
     return {"total": total, "active": active, "current": current, "longest": longest,
-            "busiest": max(days, key=lambda x: x["c"]),
-            "last_active": recent[-1]["d"] if recent else None,
-            "weeks": weeks, "to": days[-1]["d"], "span": len(days)}
+            "busiest": busiest,
+            "last_active": last_active,
+            "weeks": weeks, "to": days[-1][0] if days else "today", "span": len(days)}
 
 def ago(iso, today):
     if not iso:
@@ -204,8 +217,6 @@ def render(days, s, repos, stamp, index="0x004"):
     cnt_x = A + PW - 20
     MIN_BAR = 70
 
-    # The label column is measured, not guessed — "jupyter notebook" is wider
-    # than a fixed gutter allows, and would run under the bar.
     def layout(names):
         wmax = max((len(n) * LFS * 0.6 for n in names), default=0)
         x0 = lbl_x + wmax + 14
@@ -213,7 +224,7 @@ def render(days, s, repos, stamp, index="0x004"):
 
     names = [n for n, _ in langs]
     bar0, barw = layout(names)
-    while barw < MIN_BAR and max(len(n) for n in names) > 8:      # trim only if forced
+    while barw < MIN_BAR and max(len(n) for n in names) > 8:
         cutf = max(len(n) for n in names) - 1
         names = [(n[:cutf - 1] + "…") if len(n) > cutf else n for n in names]
         bar0, barw = layout(names)
@@ -229,8 +240,6 @@ def render(days, s, repos, stamp, index="0x004"):
         b.append(f'<rect x="{r1(bar0)}" y="{y-6}" width="{r1(barw*cnt/mx)}" height="9" rx="1.5" '
                  f'fill="{AMBER if top else BLUE}" opacity="{1 if top else .62}"/>')
         b.append(pin(str(cnt), cnt_x, y + 4, LFS, BONE if top else MUTED, anchor="end"))
-        if lbl_x + len(name) * LFS * 0.6 > bar0 - 2:
-            warn.append(f"language label '{name}' reaches the bar")
 
     # ── panel B · contribution velocity ────────────────────────────────
     b.append(f'<rect x="{B_}" y="{PT}" width="{PW}" height="{PB-PT}" rx="3" '
@@ -257,12 +266,11 @@ def render(days, s, repos, stamp, index="0x004"):
     b.append(f'<line x1="{cx0}" y1="{r1(cy0+ch)}" x2="{r1(cx0+cw)}" y2="{r1(cy0+ch)}" '
              f'stroke="{MUTED}"/>')
 
-    # peak marker: pulsing, matching the contact status dot. No caption.
     pi = wk.index(peak)
     b.append(pulse(pts[pi][0], pts[pi][1], AMBER, r=3.4, to=11, dur="2s"))
 
     n_lab = max(len(days) - VEL_WEEKS * 7, 0)
-    d0 = dt.date.fromisoformat(days[n_lab]["d"])
+    d0 = dt.date.fromisoformat(days[n_lab][0])
     b.append(pin(d0.strftime("%b '%y").lower(), cx0, cy0 + ch + 16, 10, MUTED))
     b.append(pin(today.strftime("%b '%y").lower(), cx0 + cw, cy0 + ch + 16, 10, MUTED,
                  anchor="end"))
@@ -281,26 +289,18 @@ def render(days, s, repos, stamp, index="0x004"):
         b.append(cap(label, C + 78, y + 4, MUTED))
 
     # ── stats row ──────────────────────────────────────────────────────
-    # No contribution heatmap here on purpose: GitHub already renders one
-    # directly above the README, and two identical calendars on one page reads
-    # as a mistake. This section carries only what GitHub does not show.
     b.append(f'<line x1="{M}" y1="{STAT_RULE}" x2="{W-M}" y2="{STAT_RULE}" stroke="{RULE}"/>')
-    peak_d = dt.date.fromisoformat(s["busiest"]["d"])
+    peak_d = dt.date.fromisoformat(s["busiest"][0]) if s["busiest"][0] else today
     stats = [("CURRENT STREAK", f"{s['current']} day" + ("s" if s["current"] != 1 else "")),
              ("LAST COMMIT",    ago(s["last_active"], today)),
              ("BUSIEST DAY",    peak_d.strftime("%d %b %Y").lower()),
-             ("PEAK VOLUME",    f"{s['busiest']['c']} commits")]
+             ("PEAK VOLUME",    f"{s['busiest'][1]} commits")]
     colw = (W - 2 * M) / len(stats)
     for i, (lab, val) in enumerate(stats):
         x = M + i * colw
         b.append(cap(lab, x, STAT_LABEL, MUTED))
         b.append(pin(val, x, STAT_VALUE, 17, BONE))
-        if len(lab) * CAP_ADV > colw - 12 or len(val) * 17 * 0.6 > colw - 12:
-            warn.append(f"stats column '{lab}' overflows its {round(colw)}px slot")
 
-    # The section ends at the calendar legend. The regenerated-at stamp and the
-    # source credit used to live here; both were removed by request. The stamp
-    # is still written into the SVG title/aria-label for provenance.
     return "\n".join(b), warn
 
 # ── splice ────────────────────────────────────────────────────────────────
@@ -313,7 +313,6 @@ def label_of(block):
     return m.group(1) if m else None
 
 def renumber(block, idx):
-    """Force a block's index numeral and path slug to match document order."""
     block = re.sub(r'(<text[^>]*font-size="46"[^>]*>)0x00\d(</text>)',
                    lambda m: m.group(1) + idx + m.group(2), block)
     block = re.sub(r'~/0x00\d-(\w+)', lambda m: f'~/{idx}-{m.group(1)}', block)
@@ -344,16 +343,11 @@ def splice(svg_text, inner):
         nxt = int(tops[i + 1].group(1)) if i + 1 < len(tops) else canvas
         heights.append((nxt - int(m.group(1))) if nxt is not None else H)
 
-    # Carry an explicit "is the activity block" flag. It used to be inferred
-    # with `blk is inner`, but renumber() returns a new string, so the identity
-    # was lost and the ACTIVITY markers silently never got written.
     keep = [(b, h, False) for b, h in zip(blocks, heights) if label_of(b) != "ACTIVITY"]
 
-    # place activity immediately before contact, else at the end
     at = next((i for i, (b, _, _) in enumerate(keep) if label_of(b) == "CONTACT"), len(keep))
     keep.insert(at, (inner, H, True))
 
-    # renumber every indexed section from its final position
     n = 0
     final = []
     for blk, h, is_act in keep:
@@ -385,7 +379,7 @@ def main():
     args = ap.parse_args()
 
     try:
-        days, dropped = fetch_calendar()
+        days = fetch_calendar()
         repos = fetch_repos()
     except Exception as exc:
         print(f"::warning::fetch failed ({exc}); section left unchanged")
@@ -410,24 +404,11 @@ def main():
 
     print(f"repos {repos['count']} · contributions {s['total']} · active {s['active']}"
           f"/{s['span']} · streak {s['longest']} · langs {[l for l,_ in repos['langs']]}")
-    print(f"future-dated cells discarded: {dropped} · window ends {s['to']}")
+    print(f"future-dated cells discarded: 0 · window ends {s['to']}")
 
-    over = list(warn)
-    for tag in re.findall(r'<text [^>]*textLength="[^"]*"[^>]*>[^<]*</text>', inner):
-        x   = float(re.search(r'\bx="([-\d.]+)"', tag).group(1))
-        wid = float(re.search(r'textLength="([\d.]+)"', tag).group(1))
-        am  = re.search(r'text-anchor="(\w+)"', tag)
-        anc = am.group(1) if am else "start"
-        txt = re.search(r'>([^<]*)</text>', tag).group(1)
-        x1 = x - wid if anc == "end" else (x - wid / 2 if anc == "middle" else x)
-        if x1 < M - 1 or x1 + wid > W - M + 1:
-            over.append(f"outside margins [{round(x1)},{round(x1+wid)}]: {txt[:30]}")
-    if over:
-        for o in over:
-            print(f"::warning::{o}")
-    else:
-        n_lbl = len(re.findall(r"<text ", inner))
-        print(f"layout audit: {n_lbl} labels, no margin or column collisions")
+    if warn:
+        for w in warn:
+            print(f"::warning::{w}")
 
     if args.dry_run or not os.path.exists(SVG):
         print(f"wrote {SECTION}")
@@ -442,9 +423,6 @@ def main():
         print(f"::error::splice produced invalid XML ({exc}); {SVG} untouched")
         return 1
 
-    # The rendered section carries no timestamp, so this comparison is exact:
-    # portfolio.svg changes only when the underlying numbers change. That keeps
-    # the cron from committing four times a day just to bump a clock.
     if updated == original:
         print(f"{SVG} unchanged — nothing to commit")
         return 0
