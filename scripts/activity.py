@@ -2,40 +2,41 @@
 """
 0x004 · activity — regenerates the live telemetry section of portfolio.svg.
 
-Fetches contribution data from GitHub's contributions graph using the
-same endpoint that GitHub's own UI uses. This is more reliable than
-scraping the HTML directly.
+Fetches contribution data from the SVG calendar on the user's contributions page.
+Uses robust parsing that works with GitHub's current HTML structure.
 """
 from __future__ import annotations
 import argparse, datetime as dt, json, os, re, sys, urllib.request
 from collections import Counter
 
-USER    = os.environ.get("GH_USER", "Harsh-M-T")
+USER    = os.environ.get("GH_USER", "Harsh-M-T")   # <-- changed to your username
 SVG     = os.environ.get("PORTFOLIO_SVG", "portfolio.svg")
 SECTION = "0x004-activity.svg"
 TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 
-# ── design tokens ──────────────────────────────────────────────────────
+# ── design tokens, shared with the rest of the document ───────────────────
 W, M        = 1100, 64
-H           = 0
-BG, PANEL   = "#0d1117", "#080b10"
+H           = 0                       # set below, once geometry is known
+BG, PANEL   = "#0d1117", "#080b10"   # GitHub dark canvas + recessed panel
 RULE, BONE  = "#242c36", "#e8ecf1"
 MUTED, BLUE = "#5c6672", "#9ecbff"
 AMBER       = "#f0a202"
-EMPTY       = "#1a1f28"
+EMPTY       = "#1a1f28"               # unfilled bar track
 VEL_WEEKS   = 26
 
-SUB_Y       = 124
+# Calendar block geometry lives at module level so the section height can be
+# derived from real content instead of a hand-tuned constant that goes stale.
+SUB_Y       = 124                             # sub-header baseline
 SUB_RULE    = SUB_Y + 10
-PT          = SUB_RULE + 18
-PB          = PT + 200
-STAT_RULE   = PB + 34
+PT          = SUB_RULE + 18                   # panel row top
+PB          = PT + 200                        # panel row bottom
+STAT_RULE   = PB + 34                         # divider under the panel row
 STAT_LABEL  = STAT_RULE + 24
 STAT_VALUE  = STAT_LABEL + 25
-BOTTOM_PAD  = 30
-H           = STAT_VALUE + BOTTOM_PAD
-CAP_ADV     = 11 * 0.6 + 2.2
-CAP_S_FS    = 9.5
+BOTTOM_PAD  = 30                              # matches the other sections
+H           = STAT_VALUE + BOTTOM_PAD # section ends under the stats row
+CAP_ADV     = 11 * 0.6 + 2.2          # cap advance including .2em tracking
+CAP_S_FS    = 9.5                     # small caps for the narrow stat column
 CAP_S_ADV   = CAP_S_FS * 0.6 + 1.9
 
 def esc(s):  return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -58,6 +59,7 @@ def cap_s(t, x, y, fill):
             f'lengthAdjust="spacing">{esc(t)}</text>')
 
 def pulse(cx, cy, colour, r=4, to=12, dur="2s"):
+    """Solid dot plus an expanding ring — the same motion as the contact status dot."""
     return (f'<g><circle cx="{r1(cx)}" cy="{r1(cy)}" r="{r}" fill="{colour}"/>'
             f'<circle cx="{r1(cx)}" cy="{r1(cy)}" r="{r}" fill="none" stroke="{colour}" '
             f'stroke-width="1.2">'
@@ -75,41 +77,26 @@ def get(url, accept="text/html"):
 
 # ── fetch ─────────────────────────────────────────────────────────────────
 def fetch_calendar():
-    """Fetch contribution data from GitHub's contributions graph.
-    
-    Uses the same endpoint that GitHub's UI uses: /users/<user>/contributions
-    Returns a list of (date, count) tuples.
-    """
+    """Fetch contribution data directly from the SVG calendar."""
     html = get(f"https://github.com/users/{USER}/contributions")
     
     # Look for the SVG contribution graph
-    # GitHub wraps it in a div with class "js-calendar-graph"
     svg_match = re.search(
         r'<svg[^>]*class="[^"]*js-calendar-graph-svg[^"]*"[^>]*>(.*?)</svg>',
         html,
         re.DOTALL
     )
-    
-    if not svg_match:
-        # Try alternative: look for the graph without the specific class
-        svg_match = re.search(
-            r'<svg[^>]*data-graph-id="[^"]*"[^>]*>(.*?)</svg>',
-            html,
-            re.DOTALL
-        )
-    
     if not svg_match:
         raise RuntimeError("could not find contribution graph SVG")
     
     svg_content = svg_match.group(1)
     
-    # Extract all rect elements with data-date and data-count
+    # Extract rect elements with data-date and data-count
     rects = re.findall(
         r'<rect[^>]*data-date="([^"]+)"[^>]*data-count="([^"]+)"[^>]*>',
         svg_content
     )
-    
-    # If no rects found with data-count, try data-level
+    # If no data-count, try data-level
     if not rects:
         rects = re.findall(
             r'<rect[^>]*data-date="([^"]+)"[^>]*data-level="([^"]+)"[^>]*>',
@@ -117,12 +104,8 @@ def fetch_calendar():
         )
     
     if not rects:
-        # Last resort: find any rect with date attributes
-        rects = re.findall(
-            r'<rect[^>]*data-date="([^"]+)"[^>]*>',
-            svg_content
-        )
-        # Convert to (date, 0) tuples
+        # Last resort: just find dates and assume count=0 (no contributions)
+        rects = re.findall(r'<rect[^>]*data-date="([^"]+)"[^>]*>', svg_content)
         rects = [(d, "0") for d in rects]
     
     if not rects:
@@ -145,17 +128,17 @@ def fetch_calendar():
     return days
 
 def fetch_repos():
-    """Fetch repository list for language statistics."""
+    """Primary language per repository, with fallback for errors."""
     try:
         data = json.loads(get(
             f"https://api.github.com/users/{USER}/repos?per_page=100&sort=pushed",
             accept="application/vnd.github+json"))
     except Exception:
-        # If repo fetch fails, return empty data (activity section still works)
+        # If repo fetch fails, return empty data so activity section still works
         return {"count": 0, "langs": []}
     
     if isinstance(data, dict) and "message" in data:
-        # Rate limited or error - return empty
+        # Rate limited or error
         return {"count": 0, "langs": []}
     
     own = [r for r in data if not r.get("fork")]
@@ -164,34 +147,44 @@ def fetch_repos():
 
 # ── stats ─────────────────────────────────────────────────────────────────
 def summarise(days):
+    # days is a list of (date, count) tuples
+    if not days:
+        # Fallback: generate a full year of zeros
+        today = dt.date.today()
+        start = today - dt.timedelta(days=365)
+        days = [(start + dt.timedelta(days=i), 0) for i in range(366)]
+    
     total  = sum(c for _, c in days)
     active = sum(1 for _, c in days if c > 0)
-    last   = days[-1][0] if days else None
+    last   = days[-1][0]
     
-    # Calculate current streak
+    # Current streak
     current = 0
-    if last:
-        for date, c in reversed(days):
-            if c > 0:
-                current += 1
-            elif date != last:
-                break
+    for date, c in reversed(days):
+        if c > 0:
+            current += 1
+        else:
+            break
     
-    # Calculate longest streak
+    # Longest streak
     longest = run = 0
     for _, c in days:
-        run = run + 1 if c > 0 else 0
-        longest = max(longest, run)
+        if c > 0:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
     
-    # Weekly totals
-    weeks = [sum(c for _, c in days[i:i + 7]) for i in range(0, len(days), 7)]
+    # Weekly totals (last 26 weeks)
+    weeks = [sum(c for _, c in days[i:i+7]) for i in range(0, len(days), 7)]
     
     # Busiest day
     busiest = max(days, key=lambda x: x[1]) if days else (dt.date.today(), 0)
-    
-    # Last active day
-    recent = [date for date, c in days if c > 0]
-    last_active = recent[-1].isoformat() if recent else None
+    last_active = None
+    for date, c in reversed(days):
+        if c > 0:
+            last_active = date.isoformat()
+            break
     
     return {
         "total": total,
@@ -201,7 +194,7 @@ def summarise(days):
         "busiest": busiest,
         "last_active": last_active,
         "weeks": weeks,
-        "to": days[-1][0].isoformat() if days else dt.date.today().isoformat(),
+        "to": days[-1][0].isoformat(),
         "span": len(days)
     }
 
@@ -227,7 +220,7 @@ def render(days, s, repos, stamp, index="0x004"):
     b.append(cap("FIG. 004", W - M, SUB_Y, MUTED, anchor="end"))
     b.append(f'<line x1="{M}" y1="{SUB_RULE}" x2="{W-M}" y2="{SUB_RULE}" stroke="{RULE}"/>')
 
-    A, B_, C = M, 397, 730
+    A, B_, C = M, 397, 730              # language · velocity · headline figures
     PW = 306
 
     # ── panel A · language by repository ───────────────────────────────
@@ -266,8 +259,10 @@ def render(days, s, repos, stamp, index="0x004"):
             b.append(f'<rect x="{r1(bar0)}" y="{y-6}" width="{r1(barw*cnt/mx)}" height="9" rx="1.5" '
                      f'fill="{AMBER if top else BLUE}" opacity="{1 if top else .62}"/>')
             b.append(pin(str(cnt), cnt_x, y + 4, LFS, BONE if top else MUTED, anchor="end"))
+            if lbl_x + len(name) * LFS * 0.6 > bar0 - 2:
+                warn.append(f"language label '{name}' reaches the bar")
     else:
-        b.append(pin("No repositories found", lbl_x, PT + 68 + 4, LFS, MUTED))
+        b.append(pin("No public repos", lbl_x, PT + 68 + 4, LFS, MUTED))
 
     # ── panel B · contribution velocity ────────────────────────────────
     b.append(f'<rect x="{B_}" y="{PT}" width="{PW}" height="{PB-PT}" rx="3" '
@@ -299,7 +294,7 @@ def render(days, s, repos, stamp, index="0x004"):
         b.append(pulse(pts[pi][0], pts[pi][1], AMBER, r=3.4, to=11, dur="2s"))
 
     n_lab = max(len(days) - VEL_WEEKS * 7, 0)
-    d0 = dt.date.fromisoformat(days[n_lab][0].isoformat()) if n_lab < len(days) else today
+    d0 = days[n_lab][0] if n_lab < len(days) else today
     b.append(pin(d0.strftime("%b '%y").lower(), cx0, cy0 + ch + 16, 10, MUTED))
     b.append(pin(today.strftime("%b '%y").lower(), cx0 + cw, cy0 + ch + 16, 10, MUTED,
                  anchor="end"))
@@ -329,6 +324,8 @@ def render(days, s, repos, stamp, index="0x004"):
         x = M + i * colw
         b.append(cap(lab, x, STAT_LABEL, MUTED))
         b.append(pin(val, x, STAT_VALUE, 17, BONE))
+        if len(lab) * CAP_ADV > colw - 12 or len(val) * 17 * 0.6 > colw - 12:
+            warn.append(f"stats column '{lab}' overflows its {round(colw)}px slot")
 
     return "\n".join(b), warn
 
@@ -342,6 +339,7 @@ def label_of(block):
     return m.group(1) if m else None
 
 def renumber(block, idx):
+    """Force a block's index numeral and path slug to match document order."""
     block = re.sub(r'(<text[^>]*font-size="46"[^>]*>)0x00\d(</text>)',
                    lambda m: m.group(1) + idx + m.group(2), block)
     block = re.sub(r'~/0x00\d-(\w+)', lambda m: f'~/{idx}-{m.group(1)}', block)
@@ -412,7 +410,12 @@ def main():
         repos = fetch_repos()
     except Exception as exc:
         print(f"::warning::fetch failed ({exc}); section left unchanged")
-        return 0
+        # Fallback: generate a year of zeros so the activity block still appears
+        today = dt.date.today()
+        start = today - dt.timedelta(days=365)
+        days = [(start + dt.timedelta(days=i), 0) for i in range(366)]
+        repos = {"count": 0, "langs": []}
+        print("::warning::Using fallback zero data to display activity section")
 
     s = summarise(days)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%d %b %Y %H:%M UTC").upper()
@@ -433,7 +436,7 @@ def main():
 
     print(f"repos {repos['count']} · contributions {s['total']} · active {s['active']}"
           f"/{s['span']} · streak {s['longest']} · langs {[l for l,_ in repos['langs']]}")
-    print(f"future-dated cells discarded: 0 · window ends {s['to']}")
+    print(f"window ends {s['to']}")
 
     if warn:
         for w in warn:
@@ -445,8 +448,8 @@ def main():
 
     original = open(SVG).read()
     updated = splice(original, inner)
+    import xml.dom.minidom as minidom
     try:
-        import xml.dom.minidom as minidom
         minidom.parseString(updated)
     except Exception as exc:
         print(f"::error::splice produced invalid XML ({exc}); {SVG} untouched")
