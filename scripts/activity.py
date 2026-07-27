@@ -272,8 +272,8 @@ def render(days, s, repos, stamp, index="0x004"):
 
     wk = s["weeks"][-VEL_WEEKS:] or [0]
     cx0, cy0, cw, ch = B_ + 26, PT + 62, PW - 52, 96
-    peak = max(wk) or 1
-    pts = [(cx0 + i * cw / max(len(wk) - 1, 1), cy0 + ch - v / peak * ch)
+    peak = max(wk) if wk else 0            # peak can be 0
+    pts = [(cx0 + i * cw / max(len(wk) - 1, 1), cy0 + ch - v / (peak if peak > 0 else 1) * ch)
            for i, v in enumerate(wk)]
     for f in (0, .5, 1):
         gy = cy0 + ch * f
@@ -289,7 +289,8 @@ def render(days, s, repos, stamp, index="0x004"):
     b.append(f'<line x1="{cx0}" y1="{r1(cy0+ch)}" x2="{r1(cx0+cw)}" y2="{r1(cy0+ch)}" '
              f'stroke="{MUTED}"/>')
 
-    if wk and peak > 0:
+    # peak marker – only if there is a positive peak
+    if peak > 0 and peak in wk:
         pi = wk.index(peak)
         b.append(pulse(pts[pi][0], pts[pi][1], AMBER, r=3.4, to=11, dur="2s"))
 
