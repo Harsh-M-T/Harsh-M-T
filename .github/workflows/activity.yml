@@ -1,11 +1,13 @@
 name: activity
 
-# Refreshes the 0x005 section of portfolio.svg from the public contributions
-# calendar. No token, no API quota, no secrets to configure.
+# Refreshes the 0x004 section of portfolio.svg from the public + private contributions
+# calendar. Requires a PAT with `repo` scope (full repo access) so private contributions
+# are counted. The workflow commits as the GitHub Actions bot so the refresh commit
+# does **not** inflate your own contribution graph.
 #
-# Note: GitHub suspends cron workflows on repositories with no pushes for 60
-# days. It emails you first; a single manual run re-arms it. Since this repo is
-# your profile README you will almost certainly push before then.
+# Note: GitHub suspends cron workflows on repositories with no pushes for 60 days.
+# It emails you first; a single manual run re-arms it. Since this repo is your profile
+# README you will almost certainly push before then.
 
 on:
   schedule:
@@ -28,6 +30,9 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      GH_USER: Harsh-M-T                # your GitHub login
+      GITHUB_TOKEN: ${{ secrets.PAT_REPO }}   # PAT with **repo** scope (full)
 
     steps:
       - uses: actions/checkout@v4
