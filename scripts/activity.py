@@ -6,7 +6,7 @@ Fetches contribution data from GitHub GraphQL API (includes private contribution
 when the token has `repo` scope).
 """
 from __future__ import annotations
-import argparse, datetime as dt, json, os, sys, urllib.request
+import argparse, datetime as dt, json, os, re, sys, urllib.request
 from collections import Counter
 
 USER    = os.environ.get("GH_USER", "Harsh-M-T")
