@@ -2,44 +2,42 @@
 """
 0x004 · activity — regenerates the live telemetry section of portfolio.svg.
 
-Fetches contribution data from the SVG calendar on the user's contributions page.
-Uses robust parsing that works with GitHub's current HTML structure.
+Fetches contribution data from GitHub GraphQL API (includes private contributions
+when the token has `repo` scope).
 """
 from __future__ import annotations
-import argparse, datetime as dt, json, os, re, sys, urllib.request
+import argparse, datetime as dt, json, os, sys, urllib.request
 from collections import Counter
 
-USER    = os.environ.get("GH_USER", "Harsh-M-T")   # <-- changed to your username
+USER    = os.environ.get("GH_USER", "Harsh-M-T")
 SVG     = os.environ.get("PORTFOLIO_SVG", "portfolio.svg")
 SECTION = "0x004-activity.svg"
 TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 
 # ── design tokens, shared with the rest of the document ───────────────────
 W, M        = 1100, 64
-H           = 0                       # set below, once geometry is known
-BG, PANEL   = "#0d1117", "#080b10"   # GitHub dark canvas + recessed panel
+H           = 0
+BG, PANEL   = "#0d1117", "#080b10"
 RULE, BONE  = "#242c36", "#e8ecf1"
 MUTED, BLUE = "#5c6672", "#9ecbff"
 AMBER       = "#f0a202"
-EMPTY       = "#1a1f28"               # unfilled bar track
+EMPTY       = "#1a1f28"
 VEL_WEEKS   = 26
 
-# Calendar block geometry lives at module level so the section height can be
-# derived from real content instead of a hand-tuned constant that goes stale.
-SUB_Y       = 124                             # sub-header baseline
+SUB_Y       = 124
 SUB_RULE    = SUB_Y + 10
-PT          = SUB_RULE + 18                   # panel row top
-PB          = PT + 200                        # panel row bottom
-STAT_RULE   = PB + 34                         # divider under the panel row
+PT          = SUB_RULE + 18
+PB          = PT + 200
+STAT_RULE   = PB + 34
 STAT_LABEL  = STAT_RULE + 24
 STAT_VALUE  = STAT_LABEL + 25
-BOTTOM_PAD  = 30                              # matches the other sections
-H           = STAT_VALUE + BOTTOM_PAD # section ends under the stats row
-CAP_ADV     = 11 * 0.6 + 2.2          # cap advance including .2em tracking
-CAP_S_FS    = 9.5                     # small caps for the narrow stat column
+BOTTOM_PAD  = 30
+H           = STAT_VALUE + BOTTOM_PAD
+CAP_ADV     = 11 * 0.6 + 2.2
+CAP_S_FS    = 9.5
 CAP_S_ADV   = CAP_S_FS * 0.6 + 1.9
 
-def esc(s):  return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def esc(s):  return s.replace("&", "&").replace("<", "<").replace(">", ">")
 def r1(v):   return round(v, 1)
 
 def pin(t, x, y, fs, fill, weight=400, anchor="start"):
@@ -59,7 +57,6 @@ def cap_s(t, x, y, fill):
             f'lengthAdjust="spacing">{esc(t)}</text>')
 
 def pulse(cx, cy, colour, r=4, to=12, dur="2s"):
-    """Solid dot plus an expanding ring — the same motion as the contact status dot."""
     return (f'<g><circle cx="{r1(cx)}" cy="{r1(cy)}" r="{r}" fill="{colour}"/>'
             f'<circle cx="{r1(cx)}" cy="{r1(cy)}" r="{r}" fill="none" stroke="{colour}" '
             f'stroke-width="1.2">'
@@ -67,7 +64,7 @@ def pulse(cx, cy, colour, r=4, to=12, dur="2s"):
             f'<animate attributeName="opacity" values="0.8;0" dur="{dur}" repeatCount="indefinite"/>'
             f'</circle></g>')
 
-def get(url, accept="text/html"):
+def http_get(url, accept="text/html"):
     hdr = {"User-Agent": f"{USER}-profile-activity", "Accept": accept,
            "X-Requested-With": "XMLHttpRequest"}
     if TOKEN and "api.github.com" in url:
@@ -76,97 +73,83 @@ def get(url, accept="text/html"):
         return r.read().decode("utf-8", "replace")
 
 # ── fetch ─────────────────────────────────────────────────────────────────
+GRAPHQL = """
+query($user:String!,$from:DateTime!,$to:DateTime!){
+  user(login:$user){
+    contributionsCollection(from:$from,to:$to){
+      contributionCalendar{
+        totalContributions
+        weeks{
+          contributionDays{
+            date
+            contributionCount
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 def fetch_calendar():
-    """Fetch contribution data directly from the SVG calendar."""
-    html = get(f"https://github.com/users/{USER}/contributions")
-    
-    # Look for the SVG contribution graph
-    svg_match = re.search(
-        r'<svg[^>]*class="[^"]*js-calendar-graph-svg[^"]*"[^>]*>(.*?)</svg>',
-        html,
-        re.DOTALL
+    """Return a list[(date, count)] for the last 365 days (incl. private)."""
+    today  = dt.date.today()
+    one_yr = today - dt.timedelta(days=365)
+    variables = {
+        "user": USER,
+        "from": one_yr.isoformat() + "T00:00:00Z",
+        "to":   today.isoformat()   + "T23:59:59Z",
+    }
+    payload = json.dumps({"query": GRAPHQL, "variables": variables}).encode()
+    hdr = {
+        "User-Agent": f"{USER}-profile-activity",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN}",
+    }
+    req = urllib.request.Request(
+        "https://api.github.com/graphql", data=payload, headers=hdr, method="POST"
     )
-    if not svg_match:
-        raise RuntimeError("could not find contribution graph SVG")
-    
-    svg_content = svg_match.group(1)
-    
-    # Extract rect elements with data-date and data-count
-    rects = re.findall(
-        r'<rect[^>]*data-date="([^"]+)"[^>]*data-count="([^"]+)"[^>]*>',
-        svg_content
-    )
-    # If no data-count, try data-level
-    if not rects:
-        rects = re.findall(
-            r'<rect[^>]*data-date="([^"]+)"[^>]*data-level="([^"]+)"[^>]*>',
-            svg_content
-        )
-    
-    if not rects:
-        # Last resort: just find dates and assume count=0 (no contributions)
-        rects = re.findall(r'<rect[^>]*data-date="([^"]+)"[^>]*>', svg_content)
-        rects = [(d, "0") for d in rects]
-    
-    if not rects:
-        raise RuntimeError("no contribution cells found in SVG")
-    
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+    try:
+        weeks = data["data"]["user"]["contributionsCollection"]["contributionCalendar"]["weeks"]
+    except (KeyError, TypeError) as e:
+        raise RuntimeError(f"GraphQL response malformed: {e}")
     days = []
-    today = dt.date.today()
-    for date_str, count_str in rects:
-        try:
-            date = dt.date.fromisoformat(date_str)
-            count = int(count_str) if count_str.isdigit() else 0
-        except (ValueError, TypeError):
-            continue
-        if date <= today:
-            days.append((date, count))
-    
-    if not days:
-        raise RuntimeError("no elapsed contribution days found")
-    
-    return days
+    for w in weeks:
+        for d in w["contributionDays"]:
+            days.append((dt.date.fromisoformat(d["date"]), d["contributionCount"]))
+    return [(d, c) for d, c in days if d <= today]
 
 def fetch_repos():
     """Primary language per repository, with fallback for errors."""
     try:
-        data = json.loads(get(
+        data = json.loads(http_get(
             f"https://api.github.com/users/{USER}/repos?per_page=100&sort=pushed",
             accept="application/vnd.github+json"))
     except Exception:
-        # If repo fetch fails, return empty data so activity section still works
         return {"count": 0, "langs": []}
-    
     if isinstance(data, dict) and "message" in data:
-        # Rate limited or error
         return {"count": 0, "langs": []}
-    
     own = [r for r in data if not r.get("fork")]
     langs = Counter(r["language"] for r in own if r.get("language"))
     return {"count": len(own), "langs": langs.most_common(6)}
 
 # ── stats ─────────────────────────────────────────────────────────────────
 def summarise(days):
-    # days is a list of (date, count) tuples
     if not days:
-        # Fallback: generate a full year of zeros
         today = dt.date.today()
         start = today - dt.timedelta(days=365)
         days = [(start + dt.timedelta(days=i), 0) for i in range(366)]
-    
     total  = sum(c for _, c in days)
     active = sum(1 for _, c in days if c > 0)
     last   = days[-1][0]
-    
-    # Current streak
     current = 0
-    for date, c in reversed(days):
+    for _, c in reversed(days):
         if c > 0:
             current += 1
         else:
             break
-    
-    # Longest streak
     longest = run = 0
     for _, c in days:
         if c > 0:
@@ -174,18 +157,13 @@ def summarise(days):
             longest = max(longest, run)
         else:
             run = 0
-    
-    # Weekly totals (last 26 weeks)
     weeks = [sum(c for _, c in days[i:i+7]) for i in range(0, len(days), 7)]
-    
-    # Busiest day
     busiest = max(days, key=lambda x: x[1]) if days else (dt.date.today(), 0)
     last_active = None
-    for date, c in reversed(days):
+    for d, c in reversed(days):
         if c > 0:
-            last_active = date.isoformat()
+            last_active = d.isoformat()
             break
-    
     return {
         "total": total,
         "active": active,
@@ -220,10 +198,10 @@ def render(days, s, repos, stamp, index="0x004"):
     b.append(cap("FIG. 004", W - M, SUB_Y, MUTED, anchor="end"))
     b.append(f'<line x1="{M}" y1="{SUB_RULE}" x2="{W-M}" y2="{SUB_RULE}" stroke="{RULE}"/>')
 
-    A, B_, C = M, 397, 730              # language · velocity · headline figures
+    A, B_, C = M, 397, 730
     PW = 306
 
-    # ── panel A · language by repository ───────────────────────────────
+    # panel A – language by repository
     b.append(f'<rect x="{A}" y="{PT}" width="{PW}" height="{PB-PT}" rx="3" '
              f'fill="{PANEL}" stroke="{RULE}"/>')
     b.append(cap("LANGUAGE BY REPOSITORY", A + 20, PT + 28, MUTED))
@@ -248,7 +226,6 @@ def render(days, s, repos, stamp, index="0x004"):
             names = [(n[:cutf - 1] + "…") if len(n) > cutf else n for n in names]
             bar0, barw = layout(names)
         langs = list(zip(names, [c for _, c in langs]))
-
         mx = max((c for _, c in langs), default=1)
         for i, (name, cnt) in enumerate(langs):
             y = PT + 68 + i * 23
@@ -264,7 +241,7 @@ def render(days, s, repos, stamp, index="0x004"):
     else:
         b.append(pin("No public repos", lbl_x, PT + 68 + 4, LFS, MUTED))
 
-    # ── panel B · contribution velocity ────────────────────────────────
+    # panel B – contribution velocity
     b.append(f'<rect x="{B_}" y="{PT}" width="{PW}" height="{PB-PT}" rx="3" '
              f'fill="{PANEL}" stroke="{RULE}"/>')
     b.append(cap(f"CONTRIBUTION VELOCITY · {VEL_WEEKS}W", B_ + 20, PT + 28, MUTED))
@@ -272,7 +249,7 @@ def render(days, s, repos, stamp, index="0x004"):
 
     wk = s["weeks"][-VEL_WEEKS:] or [0]
     cx0, cy0, cw, ch = B_ + 26, PT + 62, PW - 52, 96
-    peak = max(wk) if wk else 0            # peak can be 0
+    peak = max(wk) if wk else 0
     pts = [(cx0 + i * cw / max(len(wk) - 1, 1), cy0 + ch - v / (peak if peak > 0 else 1) * ch)
            for i, v in enumerate(wk)]
     for f in (0, .5, 1):
@@ -289,7 +266,6 @@ def render(days, s, repos, stamp, index="0x004"):
     b.append(f'<line x1="{cx0}" y1="{r1(cy0+ch)}" x2="{r1(cx0+cw)}" y2="{r1(cy0+ch)}" '
              f'stroke="{MUTED}"/>')
 
-    # peak marker – only if there is a positive peak
     if peak > 0 and peak in wk:
         pi = wk.index(peak)
         b.append(pulse(pts[pi][0], pts[pi][1], AMBER, r=3.4, to=11, dur="2s"))
@@ -303,7 +279,7 @@ def render(days, s, repos, stamp, index="0x004"):
     word = "accelerating" if trend > 0 else ("steady" if trend == 0 else "cooling")
     b.append(pin(f"trend — {word}", cx0, PB - 14, 10.5, MUTED))
 
-    # ── panel C · headline figures ─────────────────────────────────────
+    # panel C – headline figures
     figs = [(str(repos["count"]), "REPOSITORIES"),
             (str(s["total"]),     "CONTRIBUTIONS · 12M"),
             (str(s["active"]),    "ACTIVE DAYS"),
@@ -313,12 +289,11 @@ def render(days, s, repos, stamp, index="0x004"):
         b.append(pin(num, C + 62, y + 10, 30, AMBER, 700, anchor="end"))
         b.append(cap(label, C + 78, y + 4, MUTED))
 
-    # ── stats row ──────────────────────────────────────────────────────
+    # stats row
     b.append(f'<line x1="{M}" y1="{STAT_RULE}" x2="{W-M}" y2="{STAT_RULE}" stroke="{RULE}"/>')
-    peak_d = s["busiest"][0]
     stats = [("CURRENT STREAK", f"{s['current']} day" + ("s" if s["current"] != 1 else "")),
              ("LAST COMMIT",    ago(s["last_active"], today)),
-             ("BUSIEST DAY",    peak_d.strftime("%d %b %Y").lower()),
+             ("BUSIEST DAY",    s["busiest"][0].strftime("%d %b %Y").lower()),
              ("PEAK VOLUME",    f"{s['busiest'][1]} commits")]
     colw = (W - 2 * M) / len(stats)
     for i, (lab, val) in enumerate(stats):
@@ -340,7 +315,6 @@ def label_of(block):
     return m.group(1) if m else None
 
 def renumber(block, idx):
-    """Force a block's index numeral and path slug to match document order."""
     block = re.sub(r'(<text[^>]*font-size="46"[^>]*>)0x00\d(</text>)',
                    lambda m: m.group(1) + idx + m.group(2), block)
     block = re.sub(r'~/0x00\d-(\w+)', lambda m: f'~/{idx}-{m.group(1)}', block)
@@ -348,6 +322,7 @@ def renumber(block, idx):
     return block
 
 def splice(svg_text, inner):
+    import re
     tops = [m for m in re.finditer(r'<g transform="translate\(0,\s*(\d+)\)">', svg_text)
             if svg_text.count("<g", 0, m.start()) - svg_text.count("</g>", 0, m.start()) == 0]
     if not tops:
@@ -372,7 +347,6 @@ def splice(svg_text, inner):
         heights.append((nxt - int(m.group(1))) if nxt is not None else H)
 
     keep = [(b, h, False) for b, h in zip(blocks, heights) if label_of(b) != "ACTIVITY"]
-
     at = next((i for i, (b, _, _) in enumerate(keep) if label_of(b) == "CONTACT"), len(keep))
     keep.insert(at, (inner, H, True))
 
@@ -406,12 +380,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    if not TOKEN:
+        sys.exit("::error::GITHUB_TOKEN not set – cannot fetch private contributions")
+
     try:
         days = fetch_calendar()
         repos = fetch_repos()
     except Exception as exc:
         print(f"::warning::fetch failed ({exc}); section left unchanged")
-        # Fallback: generate a year of zeros so the activity block still appears
         today = dt.date.today()
         start = today - dt.timedelta(days=365)
         days = [(start + dt.timedelta(days=i), 0) for i in range(366)]
