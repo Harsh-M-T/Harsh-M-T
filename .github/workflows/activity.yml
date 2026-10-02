@@ -1,18 +1,9 @@
 name: activity
 
-# Refreshes the 0x004 section of portfolio.svg from the public + private contributions
-# calendar. Requires a PAT with `repo` scope (full repo access) so private contributions
-# are counted. The workflow commits as the GitHub Actions bot so the refresh commit
-# does **not** inflate your own contribution graph.
-#
-# Note: GitHub suspends cron workflows on repositories with no pushes for 60 days.
-# It emails you first; a single manual run re-arms it. Since this repo is your profile
-# README you will almost certainly push before then.
-
 on:
   schedule:
-    - cron: "17 */6 * * *"     # every 6 hours, off the hour to dodge peak load
-  workflow_dispatch:            # lets you trigger it by hand from the Actions tab
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -31,8 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      GH_USER: Harsh-M-T                # your GitHub login
-      GITHUB_TOKEN: ${{ secrets.PAT_REPO }}   # PAT with **repo** scope (full)
+      GH_USER: Harsh-M-T
+      GITHUB_TOKEN: ${{ secrets.PAT_REPO }}
 
     steps:
       - uses: actions/checkout@v4
@@ -50,13 +41,12 @@ jobs:
             echo "no change — skipping commit"
             exit 0
           fi
-
-          # Commit as the Actions bot on purpose. A commit authored by your own
-          # account would land on your contribution graph, so the section would
-          # be inflating the number it reports. The bot's commits do not count.
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add portfolio.svg 0x004-activity.svg
           git commit -m "chore: refresh activity [skip ci]"
-          git push
+          for attempt in 1 2 3; do
+            git pull --rebase --autostash origin main && git push && exit 0
+            sleep $((attempt * 3))
+          done
+          exit 1
