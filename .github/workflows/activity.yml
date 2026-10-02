@@ -46,7 +46,10 @@ jobs:
           git add portfolio.svg 0x004-activity.svg
           git commit -m "chore: refresh activity [skip ci]"
           for attempt in 1 2 3; do
-            git pull --rebase --autostash origin main && git push && exit 0
+            if git pull --rebase -X theirs origin main && git push; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
             sleep $((attempt * 3))
           done
           exit 1
